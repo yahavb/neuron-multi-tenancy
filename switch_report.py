@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Aggregate per-rank stats from tenant_switch.py into one report.
 
+Switch time (snapshot+restore) is reported separately from op (step) time:
+percentiles for each, total wall time spent in each, overhead fraction, and
+drift (first vs last decile of the run) to catch degradation over many
+switches.
+
 Usage: switch_report.py '<glob of mt_stat.rank*.json>' [out.json]
 """
 
@@ -10,13 +15,34 @@ import statistics
 import sys
 
 
+def pct(xs, p):
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(p / 100 * len(xs)))]
+
+
 def agg(xs):
     return {
-        "median_ms": statistics.median(xs),
-        "mean_ms": statistics.mean(xs),
+        "p50_ms": pct(xs, 50),
+        "p90_ms": pct(xs, 90),
+        "p99_ms": pct(xs, 99),
         "max_ms": max(xs),
+        "mean_ms": statistics.mean(xs),
+        "total_s": sum(xs) / 1e3,
         "n": len(xs),
     } if xs else {}
+
+
+def drift(xs):
+    """Median of last decile over median of first decile; >1 means it got slower."""
+    n = max(1, len(xs) // 10)
+    return statistics.median(xs[-n:]) / statistics.median(xs[:n]) if len(xs) >= 20 else None
+
+
+def fmt(a):
+    return (
+        f"p50 {a['p50_ms']:8.2f}  p90 {a['p90_ms']:8.2f}  p99 {a['p99_ms']:8.2f}  "
+        f"max {a['max_ms']:8.2f} ms  (n={a['n']})"
+    )
 
 
 def main():
@@ -28,13 +54,19 @@ def main():
 
     ranks = [json.load(open(f)) for f in files]
     r0 = ranks[0]
+
+    switch_all = [x for r in ranks for x in r["switch_ms"]]
+    step_all = [x for r in ranks for n in r["tenants"] for x in r["tenants"][n]["step_ms"]]
     report = {
         "ranks": len(ranks),
         "iters": r0["iters"],
         "switches": r0["switches"],
-        "switch": agg([x for r in ranks for x in r["switch_ms"]]),
+        "switch": agg(switch_all),
+        "switch_drift": drift(r0["switch_ms"]),
+        "ops": agg(step_all),
         "tenants": {},
     }
+
     for name in r0["tenants"]:
         step = [x for r in ranks for x in r["tenants"][name]["step_ms"]]
         snap = [x for r in ranks for x in r["tenants"][name]["snapshot_ms"]]
@@ -45,25 +77,30 @@ def main():
             "step": agg(step),
             "snapshot": agg(snap),
             "restore": agg(rest),
-            "snapshot_gbps": nbytes / 2**30 / (statistics.median(snap) / 1e3) if snap else 0,
-            "restore_gbps": nbytes / 2**30 / (statistics.median(rest) / 1e3) if rest else 0,
+            "step_drift": drift([x for x in r0["tenants"][name]["step_ms"]]),
+            "snapshot_gbps": nbytes / 2**30 / (pct(snap, 50) / 1e3) if snap else 0,
+            "restore_gbps": nbytes / 2**30 / (pct(rest, 50) / 1e3) if rest else 0,
         }
 
-    sw = report["switch"].get("median_ms", 0)
     print(f"ranks={report['ranks']} iters={report['iters']} switches={report['switches']}")
     for name, t in report["tenants"].items():
+        print(f"{name:12s} state {t['state_mib']:7.0f} MiB")
+        print(f"  step      {fmt(t['step'])}")
+        print(f"  snapshot  {fmt(t['snapshot'])}  {t['snapshot_gbps']:.1f} GiB/s")
+        print(f"  restore   {fmt(t['restore'])}  {t['restore_gbps']:.1f} GiB/s")
+
+    sw, op = report["switch"], report["ops"]
+    print(f"switch      {fmt(sw)}")
+    print(
+        f"time in ops {op['total_s']:.1f} s | time in switches {sw['total_s']:.1f} s | "
+        f"switch overhead {100 * sw['total_s'] / (sw['total_s'] + op['total_s']):.1f}% "
+        f"(at iters={report['iters']})"
+    )
+    if report["switch_drift"] is not None:
         print(
-            f"{name:12s} state {t['state_mib']:7.0f} MiB | "
-            f"step {t['step'].get('median_ms', 0):8.2f} ms | "
-            f"snapshot {t['snapshot'].get('median_ms', 0):8.2f} ms "
-            f"({t['snapshot_gbps']:.1f} GiB/s) | "
-            f"restore {t['restore'].get('median_ms', 0):8.2f} ms "
-            f"({t['restore_gbps']:.1f} GiB/s)"
+            f"switch drift (rank0, last decile / first decile): "
+            f"{report['switch_drift']:.2f}x"
         )
-    print(f"context switch (snapshot+restore) median {sw:.2f} ms")
-    steps = [t["step"].get("median_ms", 0) for t in report["tenants"].values()]
-    if sw and all(steps):
-        print(f"switch costs {sw / statistics.mean(steps):.1f}x one step")
 
     if out_path:
         with open(out_path, "w") as f:

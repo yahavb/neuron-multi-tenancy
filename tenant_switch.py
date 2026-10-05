@@ -126,7 +126,13 @@ def main():
     active = 0
     stats[tenants[active].name]["restore_ms"].append(tenants[active].restore() * 1e3)
 
-    for _ in range(SWITCHES):
+    for s_i in range(SWITCHES):
+        if RANK == 0 and s_i and s_i % 100 == 0:
+            print(
+                f"[rank 0] switch {s_i}/{SWITCHES}: recent switch median "
+                f"{median(switch_ms[-100:]):.2f} ms",
+                flush=True,
+            )
         t = tenants[active]
         for _ in range(ITERS):
             t0 = time.perf_counter()
@@ -163,7 +169,13 @@ def main():
                 f"restore {median(s['restore_ms']):.2f} ms  "
                 f"state {s['bytes'] / 2**20:.0f} MiB"
             )
+        total_op = sum(x for s in stats.values() for x in s["step_ms"])
+        total_sw = sum(switch_ms)
         print(f"[rank 0] context switch (snapshot+restore): median {median(switch_ms):.2f} ms")
+        print(
+            f"[rank 0] totals: ops {total_op / 1e3:.2f} s, switches {total_sw / 1e3:.2f} s, "
+            f"switch overhead {100 * total_sw / (total_op + total_sw):.1f}%"
+        )
 
 
 if __name__ == "__main__":

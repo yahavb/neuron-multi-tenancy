@@ -67,7 +67,7 @@ spec:
             - { name: T0_DIM,                   value: "2048" }
             - { name: T1_DIM,                   value: "1536" }
             - { name: ITERS,                    value: "10" }
-            - { name: SWITCHES,                 value: "6" }
+            - { name: SWITCHES,                 value: "1000" }
             - { name: NEURON_LOGICAL_NC_CONFIG, value: "2" }
             - { name: NEURON_CC_FLAGS,          value: "--target trn2 --lnc 2" }
             - { name: NEURON_RT_LOG_LEVEL,      value: "ERROR" }
