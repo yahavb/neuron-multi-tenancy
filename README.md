@@ -22,7 +22,7 @@ no `nrt_init`/NEFF-load on the switch path.
   writes per-rank timing JSON.
 - `switch_report.py` — aggregates rank JSONs: median step / snapshot / restore
   / switch times, copy bandwidth, switch cost as a multiple of one step.
-- `k8s/multi-tenant-job.yaml` — the Job: clones this repo at load time, runs
+- `k8s/neuron-mt-poc-job.yaml` — the Job: clones this repo at load time, runs
   torchrun, archives stats to the PVC. Uses the DRA claim below.
 - `k8s/s-lnc2-rct.yaml` — ResourceClaimTemplate: exactly 1 neuron device,
   LNC=2 (trn2/trn3).
@@ -31,7 +31,7 @@ no `nrt_init`/NEFF-load on the switch path.
 
 ```bash
 kubectl apply -f k8s/s-lnc2-rct.yaml
-kubectl apply -f k8s/multi-tenant-job.yaml
+kubectl apply -f k8s/neuron-mt-poc-job.yaml
 kubectl logs -f job/neuron-mt-poc
 ```
 

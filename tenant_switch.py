@@ -12,6 +12,10 @@ Per residency the active tenant runs ITERS steps (transposes + matmul that
 evolve its state), then we switch. We measure step time, snapshot time,
 restore time, and the full switch cost, per rank.
 
+Uses the eager torch-neuronx stack: torch.device("neuron"),
+torch.compile(backend="neuron"), execution forced by landing one element on
+host (same idiom as neuron-gridsample/frame_torchrun.py).
+
 Run under torchrun: one rank per logical NeuronCore (4 ranks for 1 device at
 LNC=2). Env knobs: T0_DIM, T1_DIM, ITERS, SWITCHES, MT_STAT.
 """
@@ -21,7 +25,7 @@ import os
 import time
 
 import torch
-import torch_xla.core.xla_model as xm
+import torch_neuronx
 
 RANK = int(os.environ.get("RANK", "0"))
 T0_DIM = int(os.environ.get("T0_DIM", "2048"))
@@ -31,18 +35,28 @@ SWITCHES = int(os.environ.get("SWITCHES", "6"))   # number of context switches
 STAT = os.environ.get("MT_STAT", "/tmp/mt_stat")
 
 
-def sync():
-    xm.mark_step()
-    xm.wait_device_ops()
+def land(t):
+    """Force execution/materialization by reading one element back to host."""
+    t.reshape(-1)[:1].cpu()
+
+
+def work(m1, m2):
+    """A few transposes and a matmul; result folded back into state so the
+    snapshot carries real progress."""
+    a = m1.t().contiguous()
+    b = m2.t().contiguous()
+    r = torch.matmul(a, b).t().contiguous()
+    return r / (r.norm() + 1e-6) * m1.norm()
 
 
 class Tenant:
     """A tenant is a named working set (m1, m2) plus the op graph that evolves it."""
 
-    def __init__(self, name, dim, device, seed):
+    def __init__(self, name, dim, device, step_fn, seed):
         self.name = name
         self.dim = dim
         self.device = device
+        self.step_fn = step_fn
         g = torch.Generator().manual_seed(seed + RANK)
         # State is born on host; restore() moves it to HBM.
         self.host = {
@@ -55,7 +69,8 @@ class Tenant:
         """Host -> HBM. Returns seconds."""
         t0 = time.perf_counter()
         self.dev = {k: v.to(self.device) for k, v in self.host.items()}
-        sync()
+        for v in self.dev.values():
+            land(v)
         return time.perf_counter() - t0
 
     def snapshot(self):
@@ -63,18 +78,12 @@ class Tenant:
         t0 = time.perf_counter()
         self.host = {k: v.cpu() for k, v in self.dev.items()}
         self.dev = None
-        sync()
         return time.perf_counter() - t0
 
     def step(self):
-        """A few transposes and a matmul; result folded back into state so the
-        snapshot carries real progress."""
-        m1, m2 = self.dev["m1"], self.dev["m2"]
-        a = m1.t().contiguous()
-        b = m2.t().contiguous()
-        r = torch.matmul(a, b).t().contiguous()
-        self.dev["m1"] = r / (r.norm() + 1e-6) * m1.norm()
-        sync()
+        with torch.no_grad():
+            self.dev["m1"] = self.step_fn(self.dev["m1"], self.dev["m2"])
+        land(self.dev["m1"])
 
     def nbytes(self):
         return sum(v.numel() * v.element_size() for v in self.host.values())
@@ -85,17 +94,21 @@ def median(xs):
 
 
 def main():
-    device = xm.xla_device()
+    torch_neuronx._lazy_init()
+    device = torch.device("neuron")
+    step_fn = torch.compile(work, backend="neuron", dynamic=False)
     tenants = [
-        Tenant("t0_dit", T0_DIM, device, seed=11),
-        Tenant("t1_unroll", T1_DIM, device, seed=23),
+        Tenant("t0_dit", T0_DIM, device, step_fn, seed=11),
+        Tenant("t1_unroll", T1_DIM, device, step_fn, seed=23),
     ]
 
     # Warm up both graphs so compilation never pollutes the measurements.
     for t in tenants:
         t.restore()
         t.step()
+        t.step()
         t.snapshot()
+    print(f"[rank {RANK}] warmup done", flush=True)
 
     stats = {
         t.name: {"step_ms": [], "snapshot_ms": [], "restore_ms": [], "bytes": t.nbytes()}
@@ -133,7 +146,7 @@ def main():
     path = f"{STAT}.rank{RANK}.json"
     with open(path, "w") as f:
         json.dump(out, f, indent=2)
-    print(f"[rank {RANK}] wrote {path}")
+    print(f"[rank {RANK}] wrote {path}", flush=True)
 
     if RANK == 0:
         for name, s in stats.items():
