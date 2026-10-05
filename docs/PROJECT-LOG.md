@@ -71,6 +71,9 @@ dit/unrolling models come after the concept is proven. **It is now proven.**
 | `dispatch_report.py` | Per model: hit rate, swap_in/swap_out/run/e2e/queue percentiles; median e2e decomposition = queue + run + dispatch(swaps+sync+http). |
 | `k8s/neuron-mt-poc-job.yaml` | Job `neuron-mt-poc` → tenant_switch (user renamed this file; keep the name). SWITCHES=1000 currently. |
 | `k8s/neuron-mt-dispatch-job.yaml` | Job `neuron-mt-dispatch` → dispatch_serve. EVENTS=200, eager/alternate currently. |
+| `bench_xfer.py` | Core-to-core transfer benchmark: host DRAM bounce vs HBM→HBM `broadcast` on the `neuron` backend, 2 ranks, size sweep, checksum-verified. |
+| `xfer_report.py` | Side-by-side table for the two transfer modes plus a fixed-cost + bandwidth fit. |
+| `k8s/neuron-mt-xfer-job.yaml` | Job `neuron-mt-xfer` → runs bench_xfer in both modes, then xfer_report. |
 | `k8s/s-lnc2-rct.yaml` | ResourceClaimTemplate (1 device, LNC=2, trn2/trn3). |
 | `docs/two-container-approach.md` | Full deferred design: shared ResourceClaim across two containers, flock + turn-file protocol on emptyDir (crash-safe, deterministic alternation, no startup sleeps), what to measure, open questions (nrt_close vs process exit, preemption, cross-pod locking via hostPath/daemonset). |
 
@@ -276,6 +279,46 @@ kubectl logs job/neuron-mt-dispatch -f
 
 The eager-vs-lazy delta is the headline for prime-video: event latency is
 dominated by state-movement policy, not device work.
+
+## Core-to-core transfer benchmark (queued, not yet run)
+
+Prompted by feedback: when a tensor moves from one NeuronCore to another,
+don't bounce it through host DRAM. Note this does **not** apply to the current
+tenancy loop. There, each tenant's state leaves a core and comes back to the
+*same* core, and it goes to host only to free HBM. It does apply wherever data
+crosses cores: dit output feeding unrolling on a different core, or moving a
+tenant to another core.
+
+`bench_xfer.py` moves one fp32 tensor from rank 0's core to rank 1's core (2
+of the 4 logical cores on the claimed device), at 1–1024 MiB, using the two
+options available today:
+
+- **host**: rank 0 copies HBM → `/dev/shm`-backed host buffer, gloo barrier
+  hand-off, rank 1 copies host → HBM. This is the best case of the DRAM path
+  (no extra host copy), and it reports d2h / handoff / h2d separately.
+- **hbm**: `dist.broadcast(src=0)` on the `neuron` process group, which runs
+  over the device fabric and never touches host memory. Setup copied from
+  `~/neuron-gridsample/bench_assembly.py`, which already ran `all_gather` on
+  this image (23.2 ms frame assembly, FINDINGS.md): no core pinning,
+  `NEURON_RT_ROOT_COMM_ID`, `torch.neuron.set_device(LOCAL_RANK)`, the
+  collective inside a `torch_neuronx.Stream`, then `torch_neuronx.synchronize()`.
+
+Why broadcast: TorchNeuronEager's `ProcessGroupNeuron`
+(`torch_neuronx/distributed/backend.py`) has no point-to-point `send`/`recv`.
+On a 2-rank group, `broadcast` is exactly one A→B copy. Mainline has it; if
+this image's build doesn't (it raises `NotImplementedError`), the script falls
+back to `all_gather` and says so. That fallback moves data both ways, so its
+times are an upper bound.
+
+Every size is checksum-verified before timing. Each timed iteration starts
+from a host barrier, and the reported time is the slower of the two ranks.
+`xfer_report.py` prints both modes side by side and fits
+`time ≈ fixed + size / bandwidth` for each.
+
+```bash
+kubectl apply -f k8s/neuron-mt-xfer-job.yaml
+kubectl logs job/neuron-mt-xfer -f | tee /tmp/neuron-mt-xfer
+```
 
 ## Roadmap after that
 
