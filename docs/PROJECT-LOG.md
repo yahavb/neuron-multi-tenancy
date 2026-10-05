@@ -74,6 +74,10 @@ dit/unrolling models come after the concept is proven. **It is now proven.**
 | `bench_xfer.py` | Core-to-core transfer benchmark: host DRAM bounce vs HBM→HBM `broadcast` on the `neuron` backend, 2 ranks, size sweep, checksum-verified. |
 | `xfer_report.py` | Side-by-side table for the two transfer modes plus a fixed-cost + bandwidth fit. |
 | `k8s/neuron-mt-xfer-job.yaml` | Job `neuron-mt-xfer` → runs bench_xfer in both modes, then xfer_report. |
+| `app_run.py` | Part 3: one request for one app as its own torchrun job — init, load graph, restore state from `/dev/shm`, run, print MT_RESULT, snapshot to `/dev/shm`, exit (releases the cores). |
+| `dispatch_proc.py` | Part 3 dispatcher (no Neuron): HTTP `/e0` `/e1` `/shutdown`, launches `app_run.py` per request, replies on MT_RESULT before the snapshot, starts the next request only after the app exits. |
+| `k8s/neuron-mt-proc-job.yaml` | Job `neuron-mt-proc` → dispatch_proc, LNC=1, 8 ranks per app, 20 requests. |
+| `k8s/s-lnc1-rct.yaml` | ResourceClaimTemplate (1 device, LNC=1). |
 | `k8s/s-lnc2-rct.yaml` | ResourceClaimTemplate (1 device, LNC=2, trn2/trn3). |
 | `docs/two-container-approach.md` | Full deferred design: shared ResourceClaim across two containers, flock + turn-file protocol on emptyDir (crash-safe, deterministic alternation, no startup sleeps), what to measure, open questions (nrt_close vs process exit, preemption, cross-pod locking via hostPath/daemonset). |
 
@@ -385,6 +389,48 @@ size / 26.97 GiB/s.
 - **Direct is still ~4× faster than via host** at 1 GiB under LNC=1 (4.07×,
   vs 4.83× at LNC=2).
 - The handoff fix is confirmed: the hand-off now reads 0.04–0.09 ms.
+
+## Part 3 — process per request (queued, not yet run)
+
+The flow the user specified: a request is dispatched to p_0, p_0 runs and the
+result goes back to the user, then p_0 copies its HBM state to host and
+releases the cores. Same for p_1. This is the real two-process design, unlike
+Parts 1–2 where both apps live in one long-running process.
+
+Releasing the cores means the process exits. TorchNeuronEager only calls
+`nrt_close()` from an atexit handler (`csrc/core/NeuronBindings.cpp`), and
+`_lazy_init()` returns early once initialized, so a live process can neither
+give its cores back nor re-acquire them. So every request starts a fresh app
+process.
+
+Per request (`dispatch_proc.py` + `app_run.py`):
+
+1. Dispatcher launches `torchrun --nproc-per-node 8 app_run.py --app K`
+   (LNC=1, so 8 ranks own the device's 8 cores).
+2. Each rank: imports and runtime init → loads the compiled graph (a warm-up
+   step on scratch tensors, so the app's state isn't touched; the graph comes
+   from the compile cache after prewarm) → restores its state from
+   `/dev/shm/mt_state` into HBM → runs 10 steps.
+3. Barrier, then rank 0 prints `MT_RESULT`; the dispatcher replies to the user
+   right away.
+4. Each rank copies its state HBM → its preallocated `/dev/shm` buffer
+   (the faster D2H path from Run 6), then the process exits and the cores are
+   released.
+5. Only then does the dispatcher start the next request. A request that arrives
+   during step 4 waits, and that wait shows up as `queue_ms`.
+
+Startup runs each app once with `--prewarm` (compile, create state), not
+counted. Timed per request: launch (torchrun + Python start), init, load,
+restore, run, snapshot, exit, the user's wait (`e2e`), and how long the device
+was held. Phase times are rank 0's.
+
+Tested locally with a stand-in `torchrun` and app (HTTP flow, early reply,
+queueing behind the previous exit, timing maths). Not yet run on hardware.
+
+```bash
+kubectl apply -f k8s/neuron-mt-proc-job.yaml
+kubectl logs job/neuron-mt-proc -f | tee /tmp/neuron-mt-proc
+```
 
 ## Roadmap after that
 
