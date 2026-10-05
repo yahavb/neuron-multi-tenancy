@@ -1,7 +1,50 @@
 # Project Log — Neuron Device Multi-Tenancy PoC
 
 Handoff document. Everything needed to continue this work is here or in the
-referenced files. Last updated: 2026-10-05.
+referenced files. Last updated: 2026-10-05. Repo HEAD at last update: see
+`git log`; last results commit `32ff425` (Run 9).
+
+## Current state and decision (read this first)
+
+**Decision: one long-running server process owns all of the device's cores
+and holds both models (dit and unrolling).** Requests come in over HTTP
+(`POST /e0`, `POST /e1`) and the server runs the requested model. If both
+models' weights fit in HBM together, both stay resident and nothing is copied.
+If they don't, the idle model's weights are swapped to host memory inside the
+same process. This is `dispatch_serve.py` with `DISPATCH_POLICY=resident`
+(keep both) or `eager` (swap after reply).
+
+Why: the Neuron runtime frees cores only when a process exits, so separate
+processes per app (Part 3) pay a full process start and shutdown per switch.
+
+Per-request overhead on top of the run, measured with the synthetic apps at
+LNC=1 on 8 cores (the dit/unrolling configuration):
+- Separate process per request (Run 8): about **18.6 s** (about 13.5 s of
+  it before any work: launch 2.8 s, init 11.5 s, graph load 1.2 s; plus a
+  2.1 s exit the next request waits for, and sometimes a ~10 s slow rank).
+- One server, swapping state per request (Run 9, `eager`): about **29 ms**
+  (copy in 8–15 ms, plus waiting for the previous model's copy out 9–15 ms).
+- One server, both models kept in HBM (Run 9, `resident`): about **0.6 ms**.
+So swapping is ~600× cheaper than restarting the process, and keeping both
+resident is ~30,000× cheaper.
+
+Caveat: the synthetic apps hold only 32 MiB of state per core. Swap cost
+scales with weights: all 8 cores share the device's host link, about
+17 GiB/s total, so about **60 ms per GB of weights on the device, per
+direction**. Multi-GB weights cost seconds per swap; aim for keeping both
+resident. At LNC=1 each core has about 12 GB of HBM (96 GB per trn2 device).
+The user's judgement: weights are most of the memory, and graphs/scratch
+staying loaded is fine.
+
+Open items, in order:
+1. Measure HBM use per core. `torch_neuronx.memory_stats` failed in this
+   build (Run 9 printed `-0 MiB`). `dispatch_serve.py` now tries other APIs
+   and prints the error plus the memory-related names `torch_neuronx` has;
+   rerun `EXPERIMENT=dispatch` to see them.
+2. Swap in the real dit and unrolling models behind the `Tenant` interface
+   (`restore` / `step` / `snapshot`) and check that both fit in 12 GB per core.
+3. If they don't fit, measure the real swap cost, and consider pinned host
+   buffers (Run 6 showed preallocated buffers double D2H speed vs `.cpu()`).
 
 ## Goal and context
 
@@ -270,7 +313,12 @@ are rank 0 only (`n=100`), since only rank 0 sees the HTTP request.
   every event; or the restore including time waiting on the device. Worth
   resolving before quoting dispatch numbers for dit/unrolling.
 
-## Immediate next step (queued, not yet run)
+## Lazy policy with bursts (never run; superseded by Part 2b / Run 9)
+
+This was the planned next step after Run 5. It was never run: Run 9's
+`resident` policy (both models always in HBM) answers the same question
+better. Kept for reference. Note the job now runs `DISPATCH_POLICIES`, so to
+run lazy set that to `lazy` rather than editing `DISPATCH_POLICY`.
 
 Lazy-policy / burst-pattern comparison — expected: ~87% hit rate (7 of 8
 events in a burst skip both copies), e2e collapsing toward pure run time:
@@ -534,26 +582,81 @@ Findings:
   the error plus the memory-related names `torch_neuronx` does have, so the
   next run shows what's available.
 
+## Slack follow-up with Liran (2026-10-05)
+
+The user posted the Run 5 results to Liran ("worked! … context switch was not
+bad, in ms … saves 50% of the current compute cost"). Liran replied: ideally
+don't bounce through DRAM just to move an HBM tensor from one NeuronCore to
+another; for now libfabric over EFA loopback could do it; going forward a
+HostCC p2p should be exposed (needed in other cases too).
+
+How that maps to this work:
+- Our time-sharing never moves data between cores. The idle app's state goes
+  to host memory to free HBM and comes back to the same cores, so host DRAM is
+  the destination, not a detour. If both models fit in HBM, no copy at all.
+- For real core-to-core transfers (e.g. dit output feeding unrolling on other
+  cores), Runs 6–7 measured the `neuron` process group `broadcast`: direct
+  HBM→HBM, about 27 GiB/s at LNC=1 (32 at LNC=2) vs about 6.6 GiB/s through
+  host memory. The backend has no point-to-point send/recv yet. EFA loopback
+  has not been tried.
+- The "ms context switch" only holds within one process. With separate
+  processes it's about 18.6 s per switch (Run 8).
+
+Reply drafted for the user to send (not confirmed sent):
+
+> Thanks! To clarify, in our setup the state doesn't move between cores. Each
+> app copies its HBM state to host memory to free HBM for the other app, then
+> copies it back to the same cores. So DRAM is the point, not a detour.
+>
+> For real core-to-core transfers we measured the torch-neuronx `neuron`
+> process group: a `broadcast` between two cores on the same device goes HBM
+> to HBM at about 27 GiB/s at LNC=1 (32 at LNC=2), versus about 6.6 GiB/s
+> through host memory. There's no point-to-point send/recv in that backend
+> yet, so a HostCC p2p would be welcome. Is EFA loopback expected to beat
+> on-device collectives for this?
+>
+> Also, the millisecond switch only holds with both models in one process.
+> With separate processes, releasing and re-acquiring the cores costs about
+> 18 seconds per switch, because NRT frees cores only at process exit. Is an
+> in-process `nrt_close` and re-init, or a faster core handover, on the
+> roadmap?
+
 ## Roadmap after that
 
-1. **Dim sweep** (`T0_DIM`/`T1_DIM` → 4096, 8192 ≈ 512 MiB/rank): fit
-   `switch_cost = a + bytes/BW`; check BW holds at size. Extrapolation at
-   ~6 GiB/s: 10 GiB tenant state ≈ 1.7 s/direction → argues for snapshotting
-   only the live working set of the real models.
-2. **Capacity proof**: make combined tenant state exceed one core's HBM —
-   a config impossible without switching. The demo-able proof.
-3. **Pinned host memory / dev/shm staging** if copy BW matters.
-4. **Replace synthetic tenants with real dit + unrolling** behind the same
-   `Tenant` interface (restore/step/snapshot) and the same event dispatcher.
-5. **Two-container version** (docs/two-container-approach.md) to quote the
-   cross-process switch cost honestly.
+The "Current state and decision" section at the top has the up-to-date open
+items. Older ideas, still valid:
+
+1. **Dim sweep** (`T0_DIM`/`T1_DIM` → 4096, 8192 ≈ 512 MiB/rank) to confirm
+   the ~17 GiB/s device-wide swap rate holds at size.
+2. **Capacity proof**: make combined state exceed one core's HBM, which is
+   impossible without swapping. Only needed if dit + unrolling don't fit.
+3. **Pinned / preallocated host buffers** for the swap path (Run 6: ~2×).
+4. **Real dit + unrolling** behind the `Tenant` interface in
+   `dispatch_serve.py`.
+5. **Separate processes** (Part 3, `dispatch_proc.py` / `app_run.py`):
+   only worth revisiting if NRT gains a fast core handover. The next
+   measurement there is already instrumented (commit `48ff268`): per-rank
+   split of init into torch import, torch_neuronx import, gloo init and
+   runtime init, plus the slowest rank per request. Not yet run. Run it with
+   `EXPERIMENT=proc` and `EVENTS=20`.
+6. **Two-container version** (docs/two-container-approach.md): same cost
+   problem as Part 3, plus cross-container coordination.
 
 ## Operational notes
 
-- User drives all `kubectl` runs manually and pastes logs to
-  `/tmp/neuron-mt-poc` / `/tmp/neuron-mt-dispatch` via `tee`. Jobs are
-  immutable — delete before re-apply.
-- Don't rename `k8s/neuron-mt-poc-job.yaml` (user chose that name).
+- User drives all `kubectl` runs manually and saves logs with `tee` under
+  `/tmp/` (`neuron-mt-poc`, `neuron-mt-dispatch`, `neuron-mt-xfer`,
+  `neuron-mt-xfer-lnc1`, `neuron-mt-proc`, `neuron-mt-dispatch-lnc1`). Jobs
+  are immutable — delete before re-apply. Standard command:
+  `kubectl delete job neuron-mt-poc --ignore-not-found && kubectl apply -f k8s/neuron-mt-poc-job.yaml && kubectl wait --for=condition=Ready pod -l job-name=neuron-mt-poc --timeout=600s && kubectl logs job/neuron-mt-poc -f | tee /tmp/<name>`
+- **One job spec only**: `k8s/neuron-mt-poc-job.yaml`. The user asked twice
+  not to create extra job specs; change settings in this file instead
+  (`EXPERIMENT`, LNC, counts). Don't rename it (user chose that name).
+- Current spec defaults: `EXPERIMENT=dispatch`,
+  `DISPATCH_POLICIES="resident eager"`, LNC=1 (`s-lnc1`), `NPROC=8`,
+  `EVENTS=200`. dit and unrolling both use LNC=1.
+- Claim templates in the repo: `k8s/s-lnc1-rct.yaml` (user's, already on the
+  cluster for 72 days) and `k8s/s-lnc2-rct.yaml`. Both claim exactly 1 device.
 - `gh` CLI authenticated as `yahavb`; push to `main` directly.
 - Smoke-test pattern used before every push: `python3 -m py_compile` + run
   report scripts against synthetic rank JSONs.

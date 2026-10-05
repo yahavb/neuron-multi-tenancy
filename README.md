@@ -1,48 +1,52 @@
 # neuron-multi-tenancy
 
-PoC for time-slicing one Neuron device (ND) between two workloads — MIG-like
-tenancy via context switching instead of hardware partitioning. The eventual
-tenants are a dit process and an unrolling process; until the concept is
-proven the tenants are synthetic (transposes + matmul over per-rank m1/m2
-tensors, state evolved every step so the snapshot carries real progress).
+PoC for letting two workloads share one Neuron device (ND) — MIG-like
+tenancy by time-sharing instead of hardware partitioning. The eventual
+workloads are dit and unrolling for prime-video; until the concept is proven
+they are synthetic apps (transposes + matmul over per-rank m1/m2 tensors,
+state evolved every step so a snapshot carries real progress).
 
-A context switch = snapshot the outgoing tenant's HBM tensors to host memory,
-restore the incoming tenant's tensors from host to HBM. The PoC measures what
-that switch costs relative to a work step.
+**Start with [docs/PROJECT-LOG.md](docs/PROJECT-LOG.md)**: current decision,
+every run's results, and open items.
 
-## Approach implemented: one-container dispatcher
+## Where it landed
 
-Both tenants live in one torchrun process group (4 ranks = 1 ND at LNC=2 on
-trn2). Both graphs stay loaded; only the active tenant's working set occupies
-HBM. Because everything is one runtime, the switch is pure tensor movement —
-no `nrt_init`/NEFF-load on the switch path.
+One long-running server process owns all of the device's cores and holds
+both models. HTTP requests (`POST /e0`, `POST /e1`) pick the model. If both
+models fit in HBM, both stay resident: about 0.6 ms of overhead per request.
+If not, the idle model's state is swapped to host memory in the same process:
+about 29 ms per request for the synthetic apps, growing with weight size
+(about 60 ms per GB of weights on the device, per direction). Separate
+processes per app cost about 18.6 s per switch, because the Neuron runtime
+frees cores only at process exit.
 
-- `tenant_switch.py` — the torchrun app: warm-up both graphs, then alternate
-  residencies (`ITERS` steps, snapshot, restore peer) for `SWITCHES` switches;
-  writes per-rank timing JSON.
-- `switch_report.py` — aggregates rank JSONs: median step / snapshot / restore
-  / switch times, copy bandwidth, switch cost as a multiple of one step.
-- `k8s/neuron-mt-poc-job.yaml` — the Job: clones this repo at load time, runs
-  torchrun, archives stats to the PVC. Uses the DRA claim below.
-- `k8s/s-lnc2-rct.yaml` — ResourceClaimTemplate: exactly 1 neuron device,
-  LNC=2 (trn2/trn3).
+## Files
 
-### Run
+- `dispatch_serve.py` + `dispatch_report.py` — the server (Part 2 / 2b):
+  policies `resident` (keep both in HBM), `eager` (reply, then swap out),
+  `lazy` (swap only when the other model is requested).
+- `tenant_switch.py` + `switch_report.py` — Part 1: fixed alternation and
+  the `Tenant` class (restore / step / snapshot) everything else reuses.
+- `app_run.py` + `dispatch_proc.py` — Part 3: a separate process per
+  request (run, reply, snapshot, exit to release the cores).
+- `bench_xfer.py` + `xfer_report.py` — core-to-core transfer: through host
+  memory vs direct HBM→HBM `broadcast`.
+- `k8s/neuron-mt-poc-job.yaml` — **the only job spec**. `EXPERIMENT` picks
+  `switch`, `dispatch`, `xfer` or `proc`. Clones this repo at start, archives
+  results to the PVC.
+- `k8s/s-lnc1-rct.yaml`, `k8s/s-lnc2-rct.yaml` — ResourceClaimTemplates,
+  1 device each, LNC=1 or LNC=2.
+- `docs/two-container-approach.md` — deferred two-container design.
+
+## Run
 
 ```bash
-kubectl apply -f k8s/s-lnc2-rct.yaml
+kubectl delete job neuron-mt-poc --ignore-not-found
 kubectl apply -f k8s/neuron-mt-poc-job.yaml
-kubectl logs -f job/neuron-mt-poc
+kubectl wait --for=condition=Ready pod -l job-name=neuron-mt-poc --timeout=600s
+kubectl logs job/neuron-mt-poc -f | tee /tmp/neuron-mt-run
 ```
 
-Knobs (env on the job): `T0_DIM` (default 2048), `T1_DIM` (1536) — distinct so
-the tenants compile distinct graphs; `ITERS` steps per residency (10);
-`SWITCHES` (6).
-
-## Approach deferred: two containers, one device
-
-The honest multi-tenancy demo — two containers sharing one ResourceClaim,
-coordinated by flock + turn file on a shared emptyDir, with full runtime
-teardown between residencies (NRT core ownership is exclusive per process).
-Design, pod sketch, locking protocol, and measurement plan are in
-[docs/two-container-approach.md](docs/two-container-approach.md).
+Defaults: `EXPERIMENT=dispatch`, `DISPATCH_POLICIES="resident eager"`,
+LNC=1 with 8 ranks (`NPROC=8`), 200 alternating requests. To change LNC,
+change the claim template, the two LNC env vars and `NPROC` together.
