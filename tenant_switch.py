@@ -24,10 +24,17 @@ import json
 import os
 import time
 
+LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
+RANK = int(os.environ.get("RANK", str(LOCAL_RANK)))
+
+# Pin one logical core per rank BEFORE NRT initializes, or every rank tries to
+# claim all visible cores and all but the first fail with "cores busy".
+CORE_BASE = int(os.environ.get("MT_CORE_BASE", "0"))
+os.environ["NEURON_RT_VISIBLE_CORES"] = str(LOCAL_RANK + CORE_BASE)
+os.environ["NEURON_RT_NUM_CORES"] = "1"
+
 import torch
 import torch_neuronx
-
-RANK = int(os.environ.get("RANK", "0"))
 T0_DIM = int(os.environ.get("T0_DIM", "2048"))
 T1_DIM = int(os.environ.get("T1_DIM", "1536"))
 ITERS = int(os.environ.get("ITERS", "10"))        # steps per residency
