@@ -280,7 +280,7 @@ kubectl logs job/neuron-mt-dispatch -f
 The eager-vs-lazy delta is the headline for prime-video: event latency is
 dominated by state-movement policy, not device work.
 
-## Core-to-core transfer benchmark (queued, not yet run)
+## Core-to-core transfer benchmark (Run 6 — results at the end of this section)
 
 Prompted by feedback: when a tensor moves from one NeuronCore to another,
 don't bounce it through host DRAM. Note this does **not** apply to the current
@@ -319,6 +319,46 @@ from a host barrier, and the reported time is the slower of the two ranks.
 kubectl apply -f k8s/neuron-mt-xfer-job.yaml
 kubectl logs job/neuron-mt-xfer -f | tee /tmp/neuron-mt-xfer
 ```
+
+### Run 6 results (commit `89c7b60`, log `/tmp/neuron-mt-xfer`)
+
+`broadcast` exists in this image's build (no fallback was used). All 12
+transfers verified. p50 ms, 20 iterations each:
+
+| MiB | via host: total | d2h | h2d | GiB/s | direct HBM→HBM | GiB/s | host ÷ direct |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.306 | 0.109 | 0.153 | 3.19 | 0.340 | 2.87 | 0.90× |
+| 4 | 0.769 | 0.332 | 0.388 | 5.08 | 0.402 | 9.71 | 1.91× |
+| 16 | 2.564 | 1.216 | 1.301 | 6.09 | 0.819 | 19.09 | 3.13× |
+| 64 | 9.727 | 4.746 | 4.922 | 6.43 | 2.313 | 27.02 | 4.21× |
+| 256 | 38.154 | 18.820 | 19.273 | 6.55 | 8.169 | 30.61 | 4.67× |
+| 1024 | 152.087 | 75.100 | 76.880 | 6.58 | 31.461 | 31.79 | 4.83× |
+
+Fits: via host ≈ 0.19 ms + size / 6.58 GiB/s; direct ≈ 0.33 ms + size / 32.1 GiB/s.
+
+The run's printed "handoff" column was wrong (≈ d2h) because it was read from
+rank 1, whose barrier wait includes rank 0's whole D2H. The real hand-off is
+total − d2h − h2d ≈ 0.04–0.1 ms. Fixed after the run: handoff is now read from
+rank 0. Totals were never affected.
+
+What it shows:
+
+- **Direct is ~4.8× faster for large tensors** (32 vs 6.6 GiB/s). The two
+  paths cross at about 1 MiB; below that the collective's ~0.33 ms fixed cost
+  makes the host path slightly faster.
+- **The host path's cost is two serialized copies.** Each direction alone runs
+  at ~13.3 GiB/s at 1 GiB, and doing D2H then H2D halves that.
+- **For dit→unrolling across cores:** at 32 GiB/s a 1 GiB activation hand-off
+  costs ~31 ms direct vs ~152 ms via host.
+- **Side finding for the tenancy switch:** D2H into a *preallocated* host buffer
+  reached ~13 GiB/s at large sizes. Part 1's snapshot uses `.cpu()` into fresh
+  memory and measured 5.8–7.7 GiB/s. Size doesn't explain the gap: m0's
+  snapshot is two 16 MiB tensors in 5.36 ms, while one 16 MiB D2H here took
+  1.216 ms (two would be ~2.4 ms). So snapshotting into preallocated host
+  buffers looks like ~2× on the switch cost. Worth testing in `tenant_switch.py`.
+- **Idea, not tested:** if HBM on a neighbouring core has room, parking an idle
+  tenant's state there via the direct path (32 GiB/s, one copy) could beat
+  parking it in host DRAM (~13 GiB/s each way).
 
 ## Roadmap after that
 

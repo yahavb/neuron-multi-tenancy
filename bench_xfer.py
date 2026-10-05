@@ -199,13 +199,15 @@ def main():
             phases.append(ph)
 
         # Phase times live on the rank that does them: d2h on rank 0, h2d on rank 1.
+        # Handoff is taken from rank 0: rank 1 reaches the barrier first and its
+        # wait there includes rank 0's whole D2H.
         ph_all = [None, None]
         dist.all_gather_object(ph_all, phases, group=host_pg)
         phase_p50 = {}
         if MODE == "host":
             phase_p50 = {
                 "d2h_ms": statistics.median(p["d2h_ms"] for p in ph_all[0]),
-                "handoff_ms": statistics.median(p["handoff_ms"] for p in ph_all[1]),
+                "handoff_ms": statistics.median(p["handoff_ms"] for p in ph_all[0]),
                 "h2d_ms": statistics.median(p["h2d_ms"] for p in ph_all[1]),
             }
 
