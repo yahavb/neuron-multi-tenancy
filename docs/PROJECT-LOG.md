@@ -394,7 +394,7 @@ size / 26.97 GiB/s.
   vs 4.83× at LNC=2).
 - The handoff fix is confirmed: the hand-off now reads 0.04–0.09 ms.
 
-## Part 3 — process per request (queued, not yet run)
+## Part 3 — process per request (Run 8 results at the end of this section)
 
 The flow the user specified: a request is dispatched to p_0, p_0 runs and the
 result goes back to the user, then p_0 copies its HBM state to host and
@@ -428,15 +428,49 @@ counted. Timed per request: launch (torchrun + Python start), init, load,
 restore, run, snapshot, exit, the user's wait (`e2e`), and how long the device
 was held. Phase times are rank 0's.
 
-Tested locally with a stand-in `torchrun` and app (HTTP flow, early reply,
-queueing behind the previous exit, timing maths). Not yet run on hardware.
-
 ```bash
 # EXPERIMENT=proc is the default in k8s/neuron-mt-poc-job.yaml
 kubectl delete job neuron-mt-poc --ignore-not-found
 kubectl apply -f k8s/neuron-mt-poc-job.yaml
 kubectl logs job/neuron-mt-poc -f | tee /tmp/neuron-mt-proc
 ```
+
+### Run 8 — Part 3 on hardware (commit `413ec9d`, log `/tmp/neuron-mt-proc`)
+
+LNC=1, 8 ranks per app, 20 alternating requests, 10 steps per request. All
+20 requests served. Prewarm (first compile): app0 29.2 s, app1 21.6 s.
+
+Per request, p50 (rank 0's phases):
+
+| phase | app0 | app1 |
+|---|---|---|
+| user waited (e2e) | 25.2 s (p90 31.2) | 18.3 s (p90 27.3) |
+| queue (waiting for the previous app to exit) | 2.15 s | 2.11 s |
+| launch (torchrun + Python start) | 2.79 s | 2.80 s |
+| init (imports + runtime init + gloo) | 11.2 s | 11.7 s |
+| load compiled graph (from cache) | 1.17 s | 1.18 s |
+| restore state host → HBM | 3.1 ms | 2.1 ms |
+| run 10 steps | 136 ms | 127 ms |
+| snapshot HBM → host (after the reply) | 18.6 ms | 10.6 ms |
+| exit (releases the cores) | 2.09 s | 2.14 s |
+
+Overall median: the user waits **18.7 s** for **0.13 s** of work, and the
+device is held 18.6 s per request. Part 2 (both apps in one process) served
+the same kind of request in 15–27 ms, so process-per-request is ~1000× slower.
+
+- **The state copies are not the problem.** Restore 2–5 ms, snapshot 11–19 ms.
+- **Process lifecycle is the whole cost**: ~2.8 s launch + ~11.5 s init +
+  ~1.2 s graph load before any work, then ~2.1 s exit that the next request
+  waits behind.
+- **Unexplained gap in some requests: up to ~10 s.** In requests 1, 4, 5, 11,
+  13 and 19 the user's wait is 8–10 s more than queue + rank-0 phases. The
+  reply goes out after a barrier across all 8 ranks, so this is most likely
+  some rank initializing much more slowly than rank 0 (whose phases are the
+  only ones logged). In the other requests the gap is ~0.1 s. That's also why
+  app0's p50 (25.2 s) is higher than app1's: more of its requests hit the gap.
+- **Next measurement needed:** split init into import torch, import
+  torch_neuronx, runtime init and gloo init, and log every rank, not just
+  rank 0. That shows where the 11 s goes and which rank causes the ~10 s gap.
 
 ## Roadmap after that
 
