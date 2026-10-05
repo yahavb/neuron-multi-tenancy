@@ -27,13 +27,20 @@ import time
 
 T_START = time.time()
 
-# Pins NEURON_RT_VISIBLE_CORES=LOCAL_RANK before torch_neuronx initializes NRT.
-from tenant_switch import LOCAL_RANK, RANK, land, work
+# Same pinning tenant_switch does on import; set here first so the import
+# timings below are not hidden inside that module's import.
+os.environ["NEURON_RT_VISIBLE_CORES"] = os.environ.get("LOCAL_RANK", "0")
+os.environ["NEURON_RT_NUM_CORES"] = "1"
 
 import numpy as np
 import torch
 import torch.distributed as dist
+
+T_TORCH = time.time()
 import torch_neuronx
+
+T_NEURONX = time.time()
+from tenant_switch import LOCAL_RANK, RANK, land, work
 
 _A = sys.argv[1:]
 APP = int(next((_A[i + 1] for i, v in enumerate(_A) if v == "--app" and i + 1 < len(_A)), "0"))
@@ -67,6 +74,7 @@ def open_state():
 
 def main():
     dist.init_process_group("gloo")
+    t_gloo = time.time()
     dev = torch.device("neuron")
     torch_neuronx._lazy_init()
     land(torch.zeros(1).to(dev))
@@ -92,12 +100,15 @@ def main():
     t_run = time.time()
 
     result = float(state["m1"].reshape(-1)[:1024].cpu().double().sum())
-    dist.barrier()
+    mine = {"rank": RANK, "t_start": T_START, "t_torch": T_TORCH, "t_neuronx": T_NEURONX,
+            "t_gloo": t_gloo, "t_init": t_init, "t_load": t_load,
+            "t_restore": t_restore, "t_run": t_run}
+    ranks = [None] * dist.get_world_size()
+    dist.all_gather_object(ranks, mine)
     if RANK == 0:
         print("MT_RESULT " + json.dumps({
             "app": APP, "prewarm": PREWARM, "created_state": created, "result": result,
-            "t_start": T_START, "t_init": t_init, "t_load": t_load,
-            "t_restore": t_restore, "t_run": t_run, "t_result": time.time(),
+            **mine, "ranks": ranks, "t_result": time.time(),
         }), flush=True)
 
     for k, v in state.items():

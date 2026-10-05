@@ -78,18 +78,34 @@ def run_app(app, prewarm=False, on_result=None):
     return rec
 
 
+STARTUP = [  # (phase, start mark, end mark) per rank
+    ("launch", "t_spawn", "t_start"),         # torchrun + Python start
+    ("torch_import", "t_start", "t_torch"),
+    ("neuronx_import", "t_torch", "t_neuronx"),
+    ("gloo_init", "t_neuronx", "t_gloo"),     # also waits for every rank to arrive
+    ("runtime_init", "t_gloo", "t_init"),     # nrt_init + first tensor on the core
+    ("load", "t_init", "t_load"),             # compiled graph from cache
+    ("restore", "t_load", "t_restore"),
+    ("run", "t_restore", "t_run"),
+]
+
+
 def phases(rec):
-    """Durations in ms. Spawn->start includes torchrun and Python start-up."""
-    return {
-        "launch_ms": (rec["t_start"] - rec["t_spawn"]) * 1e3,
-        "init_ms": (rec["t_init"] - rec["t_start"]) * 1e3,
-        "load_ms": (rec["t_load"] - rec["t_init"]) * 1e3,
-        "restore_ms": (rec["t_restore"] - rec["t_load"]) * 1e3,
-        "run_ms": (rec["t_run"] - rec["t_restore"]) * 1e3,
-        "snapshot_ms": (rec["t_snapshot"] - rec["t_result"]) * 1e3,
-        "exit_ms": (rec["t_exit"] - rec["t_snapshot"]) * 1e3,
-        "device_busy_ms": (rec["t_exit"] - rec["t_spawn"]) * 1e3,
-    }
+    """Durations in ms: rank 0's, and the slowest rank's (suffix _max)."""
+    out = {}
+    ranks = rec.get("ranks") or [rec]
+    for name, a, b in STARTUP:
+        per = [((r[b] - (rec["t_spawn"] if a == "t_spawn" else r[a])) * 1e3) for r in ranks]
+        r0 = next(r for r in ranks if r.get("rank", 0) == 0)
+        out[f"{name}_ms"] = (r0[b] - (rec["t_spawn"] if a == "t_spawn" else r0[a])) * 1e3
+        out[f"{name}_max_ms"] = max(per)
+    slowest = max(ranks, key=lambda r: r["t_run"])
+    out["slowest_rank"] = slowest.get("rank", 0)
+    out["slowest_wait_ms"] = (rec["t_result"] - rec["t_run"]) * 1e3
+    out["snapshot_ms"] = (rec["t_snapshot"] - rec["t_result"]) * 1e3
+    out["exit_ms"] = (rec["t_exit"] - rec["t_snapshot"]) * 1e3
+    out["device_busy_ms"] = (rec["t_exit"] - rec["t_spawn"]) * 1e3
+    return out
 
 
 def make_server(q):
@@ -147,8 +163,10 @@ def pct(xs, p):
 
 
 def summarize(records):
-    keys = ["queue_ms", "e2e_ms", "launch_ms", "init_ms", "load_ms", "restore_ms",
-            "run_ms", "snapshot_ms", "exit_ms", "device_busy_ms"]
+    keys = ["queue_ms", "e2e_ms"]
+    for name, _a, _b in STARTUP:
+        keys += [f"{name}_ms", f"{name}_max_ms"]
+    keys += ["slowest_wait_ms", "snapshot_ms", "exit_ms", "device_busy_ms"]
     print(f"\n=== process-per-request dispatch: {len(records)} requests, "
           f"{NPROC} ranks/app, pattern {PATTERN} ===")
     for app in (0, 1):
@@ -165,6 +183,11 @@ def summarize(records):
     run = statistics.median(r["run_ms"] for r in records)
     print(f"median request: user waits {e2e:.0f} ms (of which run {run:.1f} ms); "
           f"device held {busy:.0f} ms per request")
+    counts = {}
+    for r in records:
+        counts[r["slowest_rank"]] = counts.get(r["slowest_rank"], 0) + 1
+    print("slowest rank per request (rank: times): "
+          + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
 
 
 def main():
@@ -200,9 +223,12 @@ def main():
                "e2e_ms": (rec["t_reply"] - item.t_arrival) * 1e3, **phases(rec)}
         records.append(row)
         print(f"request {len(records)}: app{item.app}  user waited {row['e2e_ms']:.0f} ms  "
-              f"(launch {row['launch_ms']:.0f}, init {row['init_ms']:.0f}, "
+              f"(queue {queue_ms:.0f}, launch {row['launch_ms']:.0f}, "
+              f"torch {row['torch_import_ms']:.0f}, neuronx {row['neuronx_import_ms']:.0f}, "
+              f"gloo {row['gloo_init_ms']:.0f}, runtime {row['runtime_init_ms']:.0f}, "
               f"load {row['load_ms']:.0f}, restore {row['restore_ms']:.1f}, "
-              f"run {row['run_ms']:.1f})  then snapshot {row['snapshot_ms']:.1f}, "
+              f"run {row['run_ms']:.1f}, slowest rank {row['slowest_rank']} "
+              f"+{row['slowest_wait_ms']:.0f})  then snapshot {row['snapshot_ms']:.1f}, "
               f"exit {row['exit_ms']:.0f}", flush=True)
 
     srv.shutdown()
