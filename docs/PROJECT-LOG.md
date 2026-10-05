@@ -103,13 +103,163 @@ not DMA limit; pinned buffers are the known next optimization if needed.
 Overhead model: `switch/(switch + ITERS*step)` → ITERS=100 ≈ 11%, 1000 ≈ 1%.
 
 ### Run 5 — SUCCESS: event dispatch, eager policy, alternate pattern (commit `9d79a25`)
-200 HTTP events, hit rate 0% (by design — eager+alternate is worst case):
+Job `neuron-mt-dispatch`, log at `/tmp/neuron-mt-dispatch`. Full flow and
+results are in the "Event-driven dispatch" section below. Summary: 200 HTTP
+events, 0% residency hits (expected for eager+alternate, the worst case), median
+request time 26.73 ms, of which 19.97 ms is dispatch overhead (~75%). Latency
+stayed flat for all 200 events.
+
+## Event-driven dispatch (`dispatch_serve.py`) — flow and results
+
+### Why
+
+Part 1 (`tenant_switch.py`) switched tenants on a fixed schedule. The real
+dit/unrolling service will run a model when a request arrives. Part 2 replaces
+the fixed loop with a request-driven dispatcher: a request names the model it
+wants, the dispatcher puts that model's state in HBM, runs it, and (by policy)
+moves the state back to host memory.
+
+### Process layout
+
+One container runs one `torchrun --nproc-per-node 4`, so there are 4 Python
+processes, each pinned to one logical core (`NEURON_RT_VISIBLE_CORES=$LOCAL_RANK`).
+Each rank holds its own copy of both models (m0 = `t0_dit` 2048², m1 =
+`t1_unroll` 1536²) as a `Tenant` object, and both compiled graphs stay loaded
+on its core for the whole run. Ranks talk over a CPU-side gloo process group.
+Only rank 0 runs the HTTP server.
+
+### HTTP API (rank 0, port 8080, `DISPATCH_PORT`)
+
+| request | effect |
+|---|---|
+| `POST /e0` | run model m0 (dit stand-in); response returns when all 4 cores finish |
+| `POST /e1` | run model m1 (unrolling stand-in) |
+| `POST /shutdown` | all ranks exit the loop, write stats, exit cleanly |
+| anything else | 404 `{"error": "unknown event ..."}` |
+
+The request blocks until the event is served on all 4 cores. The response
+carries that event's rank-0 timings, for example:
+
+```json
+{"model": "m0", "queue_ms": 0.12, "hit": 0, "swap_out_ms": 7.43,
+ "swap_in_ms": 9.70, "run_ms": 8.59, "total_ms": 26.1, "e2e_ms": 27.18}
 ```
-m0: swap_in p50 9.70, run p50 8.59, swap_out p50 7.43, e2e p50 27.18 ms
-m1: swap_in p50 5.52, run p50 4.74, swap_out p50 3.50, e2e p50 15.37 ms
-median event: e2e 26.73 = queue 0.13 + run 6.63 + dispatch 19.97 ms  (~75% overhead)
-queue ~0.1 ms, latency flat across all 200 events
+
+(Quirk: `hit` is returned as 1/0 rather than true/false because the reply
+rounds every numeric field. Harmless.)
+
+### What happens for one event, step by step
+
+1. **Request arrives.** An HTTP handler thread on rank 0 receives `POST /e0`,
+   creates an item stamped with the arrival time, puts it on a queue, and waits.
+2. **Dequeue.** Rank 0's main loop takes the item off the queue. The time spent
+   waiting there is `queue_ms`. Events are served one at a time, in arrival order.
+3. **Broadcast.** Rank 0 broadcasts the model id to ranks 1–3 over gloo. Ranks
+   1–3 sit blocked in this broadcast between events, so all 4 cores start the
+   same event together.
+4. **Swap out** (every rank). If the other model is still in HBM, snapshot it to
+   host memory (HBM→host copy, device tensors freed). Under eager policy this
+   never happens here, because the previous event already evicted its model.
+5. **Swap in** (every rank). If the requested model isn't in HBM, restore it
+   (host→HBM copy). Timed as `swap_in_ms`. Under eager policy this happens every
+   event.
+6. **Run** (every rank). `STEPS_PER_EVENT` (10) steps of transposes + matmul,
+   each forced to complete on the device. Timed as `run_ms`.
+7. **Write back** (eager policy only). Snapshot the model's state to host memory
+   right away, so HBM is empty between events. Added to `swap_out_ms`. Under lazy
+   policy the model stays in HBM until a request for the other model evicts it
+   in step 4.
+8. **Barrier.** All 4 ranks wait for each other. The event counts as served
+   only when every core is done.
+9. **Reply.** Rank 0 measures `e2e_ms` from arrival to now, fills the reply,
+   and wakes the HTTP handler, which returns the JSON response.
+
 ```
+caller        rank0 HTTP thread     rank0 main loop          ranks 1-3
+  | POST /e0 ->|                      |                          |
+  |            |-- queue.put(item) -->|                          |
+  |            |   (waits)            |-- broadcast(model=0) --->|
+  |            |                      |  swap in m0 / run 10 /   |  same, on own core
+  |            |                      |  snapshot m0 to host     |
+  |            |                      |<======= barrier ========>|
+  |            |<-- reply + done -----|                          |
+  |<- 200 JSON-|                      |                          |
+```
+
+### Where events come from
+
+- `EVENT_SOURCE=self` (default, used in Run 5): a generator thread on rank 0
+  sends `EVENTS` real HTTP requests to `127.0.0.1:8080`, one at a time (each
+  waits for its response), then sends `/shutdown`. The order comes from
+  `EVENT_PATTERN`: `alternate` = e0,e1,e0,e1…; `burst` = 8×e0, 8×e1, …
+  (`EVENT_BURST`); `random` = seeded random choice.
+- `EVENT_SOURCE=external`: the server waits for outside callers. To drive it
+  by hand:
+  ```bash
+  POD=$(kubectl get pod -l job-name=neuron-mt-dispatch -o name)
+  kubectl port-forward "$POD" 8080:8080 &
+  curl -s -X POST localhost:8080/e0
+  curl -s -X POST localhost:8080/e1
+  curl -s -X POST localhost:8080/shutdown   # required, or the job runs until activeDeadlineSeconds
+  ```
+
+### Run 5 settings
+
+`DISPATCH_POLICY=eager`, `EVENT_PATTERN=alternate`, `EVENTS=200`,
+`STEPS_PER_EVENT=10`, `EVENT_SOURCE=self`, `T0_DIM=2048`, `T1_DIM=1536`,
+4 ranks, fp32. Commit `9d79a25`.
+
+### Run 5 results (verbatim from `/tmp/neuron-mt-dispatch`)
+
+```
+[rank 0] served 50 events, recent e2e median 26.93 ms
+[rank 0] served 100 events, recent e2e median 26.73 ms
+[rank 0] served 150 events, recent e2e median 26.92 ms
+[rank 0] served 200 events, recent e2e median 26.87 ms
+policy=eager pattern=alternate events=200 steps/event=10 ranks=4
+m0: 100 events, residency hit rate 0%
+  swap_in   p50     9.70  p90     9.75  p99     9.77  max    11.96 ms  (n=400)
+  swap_out  p50     7.43  p90     8.64  p99    10.52  max    12.67 ms  (n=400)
+  run       p50     8.59  p90     8.71  p99     8.96  max    10.85 ms  (n=400)
+  e2e       p50    27.18  p90    28.06  p99    30.30  max    30.30 ms  (n=100)
+  queue     p50     0.12  p90     0.16  p99     0.33  max     0.33 ms  (n=100)
+m1: 100 events, residency hit rate 0%
+  swap_in   p50     5.52  p90     5.56  p99     5.58  max     5.61 ms  (n=400)
+  swap_out  p50     3.50  p90     4.80  p99     5.15  max     6.42 ms  (n=400)
+  run       p50     4.74  p90     4.86  p99     5.00  max     5.03 ms  (n=400)
+  e2e       p50    15.37  p90    15.65  p99    16.09  max    16.09 ms  (n=100)
+  queue     p50     0.14  p90     0.17  p99     0.20  max     0.20 ms  (n=100)
+median event: e2e 26.73 ms = queue 0.13 + run 6.63 + dispatch(swaps+sync+http) 19.97 ms
+```
+
+`n=400` = 100 events × 4 ranks (per-rank timings pooled). `e2e` and `queue`
+are rank 0 only (`n=100`), since only rank 0 sees the HTTP request.
+
+### What Run 5 shows
+
+- **The flow works.** 200 requests through the real HTTP path, each fanned out
+  to 4 cores and answered after all of them finished. Nothing hung or crashed,
+  and shutdown was clean.
+- **Stable.** The request-time median stayed at 26.7–26.9 ms across all four
+  50-event checkpoints. p99 sits close to p50 (m0: 30.3 vs 27.2 ms).
+- **Queueing is negligible** (~0.1 ms), as expected with one request in flight
+  at a time.
+- **Compute matches Part 1.** m0 run 8.59 ms / 10 steps = 0.86 ms per step
+  (Part 1: 0.83 ms). m1: 0.47 ms per step (Part 1: 0.46 ms).
+- **Copies dominate.** Per m0 request: 9.70 swap-in + 8.59 run + 7.43 write-back
+  ≈ 25.7 of the 27.2 ms e2e. The remaining ~1.5 ms is broadcast, barrier and
+  HTTP. For m1: 5.52 + 4.74 + 3.50 ≈ 13.8 of 15.4 ms.
+- **The pooled breakdown line is approximate.** It takes medians across both
+  models (run 6.63 ms sits between m0's 8.59 and m1's 4.74), so use the
+  per-model lines for exact numbers.
+- **Open question: swap-in is about 2.5× slower than in Part 1.** m0 restore:
+  9.70 ms here vs 3.94 ms in Run 4; m1: 5.52 vs 2.20 ms. Compute is unchanged,
+  and the spread is very tight (m0 p50 9.70, p90 9.75), which points to a fixed
+  per-restore cost rather than noise. Not yet explained. Things to check: extra
+  host threads (HTTP server, generator, gloo) competing with the copy at
+  `OMP_NUM_THREADS=1`; eager eviction freeing and re-allocating device memory
+  every event; or the restore including time waiting on the device. Worth
+  resolving before quoting dispatch numbers for dit/unrolling.
 
 ## Immediate next step (queued, not yet run)
 
