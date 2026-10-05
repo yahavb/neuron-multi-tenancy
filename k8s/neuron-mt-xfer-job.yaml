@@ -13,7 +13,7 @@ spec:
         node-type: trn2
       resourceClaims:
         - name: neurons
-          resourceClaimTemplateName: s-lnc2
+          resourceClaimTemplateName: s-lnc1
       containers:
         - name: xfer
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b@sha256:404df227713513e8d01dadc03a8722825c8b9b526561c8d08897a6a5fecc0f06
@@ -67,8 +67,8 @@ spec:
             - { name: BRANCH,                   value: "main" }
             - { name: SIZES_MIB,                value: "1,4,16,64,256,1024" }
             - { name: ITERS,                    value: "20" }
-            - { name: NEURON_LOGICAL_NC_CONFIG, value: "2" }
-            - { name: NEURON_CC_FLAGS,          value: "--target trn2 --lnc 2" }
+            - { name: NEURON_LOGICAL_NC_CONFIG, value: "1" }
+            - { name: NEURON_CC_FLAGS,          value: "--target trn2 --lnc 1" }
             - { name: NEURON_RT_LOG_LEVEL,      value: "ERROR" }
             - name: GITHUB_TOKEN
               valueFrom: { secretKeyRef: { name: github-token, key: GITHUB_TOKEN } }
