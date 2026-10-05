@@ -472,7 +472,7 @@ the same kind of request in 15–27 ms, so process-per-request is ~1000× slower
   torch_neuronx, runtime init and gloo init, and log every rank, not just
   rank 0. That shows where the 11 s goes and which rank causes the ~10 s gap.
 
-## Part 2b — one server, keep both models in HBM (queued, not yet run)
+## Part 2b — one server, keep both models in HBM (Run 9 results at the end of this section)
 
 Decision after Run 8: one long-running server process owns all 8 cores and
 holds both models, so the ~13 s process start-up is paid once. Weights are
@@ -497,6 +497,42 @@ kubectl delete job neuron-mt-poc --ignore-not-found
 kubectl apply -f k8s/neuron-mt-poc-job.yaml
 kubectl logs job/neuron-mt-poc -f | tee /tmp/neuron-mt-dispatch-lnc1
 ```
+
+### Run 9 results (commit `8ea14b4`, log `/tmp/neuron-mt-dispatch-lnc1`)
+
+LNC=1, 8 ranks, 200 alternating requests per policy, 10 steps per request.
+
+Keep both resident (no copies), p50:
+- m0 (2048², dit stand-in): user waited 16.9 ms, run 16.3 ms.
+- m1 (1536², unrolling stand-in): user waited 8.6 ms, run 8.1 ms.
+- Overhead on top of the run is about 0.6 ms (broadcast, barrier, HTTP).
+  Stable over all 200 requests (rolling median 16.65–16.85 ms).
+
+Swap after reply, p50:
+- m0: user waited 46.1 ms = queue 10.2 + swap-in 14.8 + run 16.0 + ~5.
+  Copy-back after the reply took 15.0 ms.
+- m1: user waited 37.7 ms = queue 18.6 + swap-in 8.3 + run 8.0 + ~3.
+  Copy-back 8.8 ms.
+- The queue is each request waiting for the previous model's copy-back. So
+  replying first moves that copy out of the request that caused it, but with
+  alternating traffic the next request pays it instead.
+
+Findings:
+- Keeping both models resident makes switching essentially free: the user
+  waits for the run plus about half a millisecond.
+- Swapping roughly doubles to triples the wait for these small states, and
+  cost grows with weight size (see next point).
+- Copies from all 8 cores share the device's host link. m0 moves
+  8 × 32 MiB = 256 MiB per direction in ~15 ms, about 17 GiB/s for the whole
+  device. For real models, budget roughly 60 ms per direction per GB of
+  weights on the device. Multi-GB weights would cost seconds per switch,
+  which is why keeping both resident matters.
+- Per-step time at LNC=1 is about 1.6 ms for m0 versus 0.86 ms at LNC=2,
+  as expected with half the compute per core.
+- HBM stats came back empty (`-0 MiB`): `torch_neuronx.memory_stats` failed
+  in this build. The server now tries `memory_allocated` variants and prints
+  the error plus the memory-related names `torch_neuronx` does have, so the
+  next run shows what's available.
 
 ## Roadmap after that
 

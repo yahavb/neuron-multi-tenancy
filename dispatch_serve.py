@@ -127,19 +127,39 @@ class Dispatcher:
         self.records[-1]["hbm_bytes"] = hbm_bytes()
 
 
+_HBM_WARNED = False
+
+
+def _try_hbm(fns):
+    global _HBM_WARNED
+    errors = []
+    for label, fn in fns:
+        try:
+            return int(fn())
+        except Exception as e:
+            errors.append(f"{label}: {type(e).__name__}: {e}")
+    if RANK == 0 and not _HBM_WARNED:
+        _HBM_WARNED = True
+        names = [n for n in dir(torch_neuronx) if "mem" in n.lower()]
+        print("[rank 0] HBM stats unavailable: " + " | ".join(errors)
+              + f" | torch_neuronx memory names: {names}", flush=True)
+    return -1
+
+
 def hbm_bytes():
     """Bytes held by this core's caching allocator (tensors + cached blocks)."""
-    try:
-        return int(torch_neuronx.memory_stats()["allocated_bytes"]["current"])
-    except Exception:
-        return -1
+    return _try_hbm([
+        ("torch_neuronx.memory_allocated", lambda: torch_neuronx.memory_allocated()),
+        ("torch.neuron.memory_allocated", lambda: torch.neuron.memory_allocated()),
+        ("memory_stats", lambda: torch_neuronx.memory_stats()["allocated_bytes"]["current"]),
+    ])
 
 
 def hbm_peak_bytes():
-    try:
-        return int(torch_neuronx.max_memory_allocated())
-    except Exception:
-        return -1
+    return _try_hbm([
+        ("torch_neuronx.max_memory_allocated", lambda: torch_neuronx.max_memory_allocated()),
+        ("torch.neuron.max_memory_allocated", lambda: torch.neuron.max_memory_allocated()),
+    ])
 
 
 def make_server(q):
@@ -195,8 +215,8 @@ def main():
     dist.init_process_group("gloo")
     device = torch.device("neuron")
     d = Dispatcher(device)
-    print(f"[rank {RANK}] warmup done, policy={POLICY}, HBM in use "
-          f"{d.hbm_ready / 2**20:.0f} MiB", flush=True)
+    hbm = f"{d.hbm_ready / 2**20:.0f} MiB" if d.hbm_ready >= 0 else "unknown"
+    print(f"[rank {RANK}] warmup done, policy={POLICY}, HBM in use {hbm}", flush=True)
     dist.barrier()
 
     q = None
