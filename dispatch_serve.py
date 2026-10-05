@@ -8,10 +8,13 @@ POST /e1 dispatches m1. The event id is broadcast to all ranks (gloo), every
 rank swaps the target model into HBM if needed, runs STEPS_PER_EVENT steps,
 and per DISPATCH_POLICY writes the model state back to host memory:
 
-  eager (default): snapshot after every event — device HBM is empty between
-      events, matching "triggered, then written to host memory".
+  eager (default): reply to the user, then snapshot the model to host, so its
+      HBM is free before the next event. The snapshot is outside the user's
+      wait but the next event waits for it.
   lazy: leave the model resident; evict only when the *other* model is
       requested. Consecutive same-model events skip both copies.
+  resident: both models stay in HBM for the whole run; no copies at all.
+      Only possible when both fit.
 
 Per event, per rank we record: queue wait, swap-out (eviction), swap-in
 (restore), run time, and on rank 0 the end-to-end latency the HTTP caller saw.
@@ -78,14 +81,20 @@ class Dispatcher:
             m.step()
             m.step()
             m.snapshot()
+        self.hbm_after_warmup = hbm_bytes()
+        if POLICY == "resident":
+            for m in self.models:
+                m.restore()
+        self.hbm_ready = hbm_bytes()
 
     def handle(self, mid):
+        """Everything the user waits for: make the model resident, run it."""
         t0 = time.perf_counter()
         m = self.models[mid]
         hit = m.dev is not None
         swap_out = swap_in = 0.0
 
-        if self.resident is not None and self.resident != mid:
+        if POLICY != "resident" and self.resident is not None and self.resident != mid:
             swap_out = self.models[self.resident].snapshot()
             self.resident = None
         if m.dev is None:
@@ -97,11 +106,6 @@ class Dispatcher:
             m.step()
         run = time.perf_counter() - t_run
 
-        if POLICY == "eager":
-            # Result written back to host memory as part of serving the event.
-            swap_out += m.snapshot()
-            self.resident = None
-
         rec = {
             "model": mid,
             "hit": hit,
@@ -109,9 +113,33 @@ class Dispatcher:
             "swap_in_ms": swap_in * 1e3,
             "run_ms": run * 1e3,
             "total_ms": (time.perf_counter() - t0) * 1e3,
+            "after_reply_ms": 0.0,
         }
         self.records.append(rec)
         return rec
+
+    def after_reply(self):
+        """Work done after the user has the result; the next event waits for it."""
+        if POLICY == "eager" and self.resident is not None:
+            t = self.models[self.resident].snapshot()
+            self.resident = None
+            self.records[-1]["after_reply_ms"] = t * 1e3
+        self.records[-1]["hbm_bytes"] = hbm_bytes()
+
+
+def hbm_bytes():
+    """Bytes held by this core's caching allocator (tensors + cached blocks)."""
+    try:
+        return int(torch_neuronx.memory_stats()["allocated_bytes"]["current"])
+    except Exception:
+        return -1
+
+
+def hbm_peak_bytes():
+    try:
+        return int(torch_neuronx.max_memory_allocated())
+    except Exception:
+        return -1
 
 
 def make_server(q):
@@ -167,7 +195,8 @@ def main():
     dist.init_process_group("gloo")
     device = torch.device("neuron")
     d = Dispatcher(device)
-    print(f"[rank {RANK}] warmup done, policy={POLICY}", flush=True)
+    print(f"[rank {RANK}] warmup done, policy={POLICY}, HBM in use "
+          f"{d.hbm_ready / 2**20:.0f} MiB", flush=True)
     dist.barrier()
 
     q = None
@@ -201,13 +230,17 @@ def main():
         if RANK == 0:
             e2e_ms = (time.perf_counter() - item.t_arrival) * 1e3
             e2e.append({"model": mid, "queue_ms": queue_ms, "e2e_ms": e2e_ms})
-            item.reply = {"model": f"m{mid}", "queue_ms": round(queue_ms, 3),
-                          **{k: round(v, 3) for k, v in rec.items() if k != "model"},
+            item.reply = {"model": f"m{mid}", "hit": rec["hit"],
+                          "queue_ms": round(queue_ms, 3),
+                          "swap_out_ms": round(rec["swap_out_ms"], 3),
+                          "swap_in_ms": round(rec["swap_in_ms"], 3),
+                          "run_ms": round(rec["run_ms"], 3),
                           "e2e_ms": round(e2e_ms, 3)}
             item.done.set()
             if served % 50 == 0:
                 print(f"[rank 0] served {served} events, recent e2e median "
                       f"{median([x['e2e_ms'] for x in e2e[-50:]]):.2f} ms", flush=True)
+        d.after_reply()
 
     out = {
         "rank": RANK,
@@ -217,6 +250,9 @@ def main():
         "steps_per_event": STEPS_PER_EVENT,
         "records": d.records,
         "e2e": e2e if RANK == 0 else None,
+        "hbm_after_warmup": d.hbm_after_warmup,
+        "hbm_ready": d.hbm_ready,
+        "hbm_peak": hbm_peak_bytes(),
     }
     path = f"{STAT}.rank{RANK}.json"
     with open(path, "w") as f:

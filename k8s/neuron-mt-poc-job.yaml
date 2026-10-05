@@ -59,11 +59,17 @@ spec:
                     "$OUT/switch_report.json" 2>&1 | tee "$OUT/report.log"
                   ;;
                 dispatch)
-                  MT_STAT="$OUT/dispatch_stat" \
-                    torchrun --standalone --nproc-per-node "$NPROC" \
-                      dispatch_serve.py 2>&1 | tee "$OUT/dispatch.log"
-                  python3 -u dispatch_report.py "$OUT/dispatch_stat.rank*.json" \
-                    "$OUT/dispatch_report.json" 2>&1 | tee "$OUT/report.log"
+                  for P in $DISPATCH_POLICIES; do
+                    echo "=== dispatch policy $P ==="
+                    DISPATCH_POLICY="$P" MT_STAT="$OUT/dispatch_$P" \
+                      torchrun --standalone --nproc-per-node "$NPROC" \
+                        dispatch_serve.py 2>&1 | tee "$OUT/dispatch_$P.log" || true
+                  done
+                  for P in $DISPATCH_POLICIES; do
+                    echo "=== report: policy $P ==="
+                    python3 -u dispatch_report.py "$OUT/dispatch_$P.rank*.json" \
+                      "$OUT/dispatch_${P}_report.json" 2>&1 | tee -a "$OUT/report.log" || true
+                  done
                   ;;
                 xfer)
                   for M in host hbm; do
@@ -93,7 +99,7 @@ spec:
           env:
             # switch = tenant_switch (Part 1), dispatch = dispatch_serve (Part 2),
             # xfer = core-to-core transfer bench, proc = process per request (Part 3)
-            - { name: EXPERIMENT,               value: "proc" }
+            - { name: EXPERIMENT,               value: "dispatch" }
             # ranks per app; must equal the core count: 8 at LNC=1, 4 at LNC=2
             - { name: NPROC,                    value: "8" }
             - { name: PYTHONUNBUFFERED,         value: "1" }
@@ -103,13 +109,14 @@ spec:
             # switch
             - { name: ITERS,                    value: "10" }
             - { name: SWITCHES,                 value: "1000" }
-            # dispatch and proc
-            - { name: EVENTS,                   value: "20" }
+            # dispatch and proc (proc takes ~19 s per event; use ~20 there)
+            - { name: EVENTS,                   value: "200" }
             - { name: EVENT_PATTERN,            value: "alternate" }
             - { name: EVENT_BURST,              value: "4" }
             - { name: STEPS_PER_EVENT,          value: "10" }
             - { name: EVENT_SOURCE,             value: "self" }
-            - { name: DISPATCH_POLICY,          value: "eager" }
+            # dispatch: policies run back to back (resident | eager | lazy)
+            - { name: DISPATCH_POLICIES,        value: "resident eager" }
             # xfer
             - { name: SIZES_MIB,                value: "1,4,16,64,256,1024" }
             - { name: XFER_ITERS,               value: "20" }

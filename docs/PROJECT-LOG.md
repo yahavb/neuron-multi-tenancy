@@ -472,6 +472,32 @@ the same kind of request in 15–27 ms, so process-per-request is ~1000× slower
   torch_neuronx, runtime init and gloo init, and log every rank, not just
   rank 0. That shows where the 11 s goes and which rank causes the ~10 s gap.
 
+## Part 2b — one server, keep both models in HBM (queued, not yet run)
+
+Decision after Run 8: one long-running server process owns all 8 cores and
+holds both models, so the ~13 s process start-up is paid once. Weights are
+most of the memory, and at LNC=1 each core has about 12 GB of HBM. If both
+models fit, keep both resident and copy nothing. If not, swap the idle
+model's weights to host memory inside the same process (milliseconds).
+
+Changes to `dispatch_serve.py`:
+- New policy `resident`: both models are loaded into HBM before serving and
+  never copied out.
+- `eager` now replies to the user first, then copies the state to host
+  (`after_reply_ms`). The next request still waits for that copy.
+- HBM use per core is logged (torch_neuronx caching-allocator stats) after
+  warm-up, when serving starts, and at peak.
+
+The job (`EXPERIMENT=dispatch`, the default now) runs `DISPATCH_POLICIES`
+back to back, `resident` then `eager`, at LNC=1 with 8 ranks and 200
+alternating requests each, and prints one report per policy.
+
+```bash
+kubectl delete job neuron-mt-poc --ignore-not-found
+kubectl apply -f k8s/neuron-mt-poc-job.yaml
+kubectl logs job/neuron-mt-poc -f | tee /tmp/neuron-mt-dispatch-lnc1
+```
+
 ## Roadmap after that
 
 1. **Dim sweep** (`T0_DIM`/`T1_DIM` → 4096, 8192 ≈ 512 MiB/rank): fit

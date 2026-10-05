@@ -73,6 +73,7 @@ def main():
             "hit_rate": hits / len(mr),
             "swap_in": agg([x["swap_in_ms"] for x in mr if x["swap_in_ms"] > 0]),
             "swap_out": agg([x["swap_out_ms"] for x in mr if x["swap_out_ms"] > 0]),
+            "after_reply": agg([x.get("after_reply_ms", 0) for x in mr if x.get("after_reply_ms", 0) > 0]),
             "run": agg([x["run_ms"] for x in mr]),
             "e2e": agg(me),
             "queue": agg(mq),
@@ -81,6 +82,7 @@ def main():
         print(f"m{mid}: {m['events']} events, residency hit rate {100 * m['hit_rate']:.0f}%")
         print(f"  swap_in   {fmt(m['swap_in'])}")
         print(f"  swap_out  {fmt(m['swap_out'])}")
+        print(f"  after_reply (snapshot after the user has the result) {fmt(m['after_reply'])}")
         print(f"  run       {fmt(m['run'])}")
         print(f"  e2e       {fmt(m['e2e'])}")
         print(f"  queue     {fmt(m['queue'])}")
@@ -98,6 +100,17 @@ def main():
         }
         print(f"median event: e2e {e2e_p50:.2f} ms = queue {q_p50:.2f} + "
               f"run {run_p50:.2f} + dispatch(swaps+sync+http) {swap_p50:.2f} ms")
+
+    gib = lambda b: b / 2**30
+    if all(r.get("hbm_ready", -1) >= 0 for r in ranks):
+        ready = max(r["hbm_ready"] for r in ranks)
+        warm = max(r["hbm_after_warmup"] for r in ranks)
+        peak = max(r["hbm_peak"] for r in ranks)
+        report["hbm"] = {"after_warmup_gib": gib(warm), "ready_gib": gib(ready), "peak_gib": gib(peak)}
+        print(f"HBM per core (worst rank): after warmup {gib(warm):.3f} GiB, "
+              f"when serving starts {gib(ready):.3f} GiB, peak {gib(peak):.3f} GiB")
+    else:
+        print("HBM per core: memory stats not available in this build")
 
     if out_path:
         with open(out_path, "w") as f:
