@@ -360,6 +360,32 @@ What it shows:
   tenant's state there via the direct path (32 GiB/s, one copy) could beat
   parking it in host DRAM (~13 GiB/s each way).
 
+### Run 7 — same benchmark at LNC=1 (commit `42c4b7f`, log `/tmp/neuron-mt-xfer-lnc1`)
+
+`k8s/neuron-mt-xfer-job.yaml` now uses the `s-lnc1` claim with LNC settings of
+1, so rank 0 and rank 1 are physical cores 0 and 1 (at LNC=2 they were cores
+0–1 and 2–3). All 12 transfers verified. p50 ms:
+
+| MiB | via host LNC=1 | via host LNC=2 | direct LNC=1 | direct LNC=2 |
+|---|---|---|---|---|
+| 1 | 0.304 | 0.306 | 0.291 | 0.340 |
+| 16 | 2.573 | 2.564 | 0.846 | 0.819 |
+| 256 | 38.172 | 38.154 | 9.553 | 8.169 |
+| 1024 | 152.074 | 152.087 | 37.326 | 31.461 |
+
+Fits at LNC=1: via host ≈ 0.19 ms + size / 6.58 GiB/s; direct ≈ 0.26 ms +
+size / 26.97 GiB/s.
+
+- **Via host is identical at both LNC settings** (6.58 GiB/s). It's bound by
+  the PCIe and host-memory copies, not by the core.
+- **Direct is ~16% slower at LNC=1** (26.8 vs 31.8 GiB/s at 1 GiB), but has a
+  lower fixed cost (0.26 vs 0.33 ms), so it now beats the host path even at
+  1 MiB. A likely reason is that an LNC=2 core has the DMA engines of two
+  physical cores. That's an assumption; it hasn't been checked.
+- **Direct is still ~4× faster than via host** at 1 GiB under LNC=1 (4.07×,
+  vs 4.83× at LNC=2).
+- The handoff fix is confirmed: the hand-off now reads 0.04–0.09 ms.
+
 ## Roadmap after that
 
 1. **Dim sweep** (`T0_DIM`/`T1_DIM` → 4096, 8192 ≈ 512 MiB/rank): fit
