@@ -69,19 +69,20 @@ dit/unrolling models come after the concept is proven. **It is now proven.**
 | `switch_report.py` | Aggregates rank JSONs: p50/p90/p99/max per phase, time-in-ops vs time-in-switches, overhead %, drift (last/first decile). |
 | `dispatch_serve.py` | Part 2: event-driven dispatch. Rank 0 runs HTTP server (:8080): `POST /e0`→m0, `POST /e1`→m1, `POST /shutdown`. Event id broadcast to all 4 ranks via gloo (`init_process_group("gloo")`); each rank swaps target model in if absent, runs `STEPS_PER_EVENT` steps, then per `DISPATCH_POLICY`: `eager`=snapshot to host after every event (device empty between events); `lazy`=stay resident, evict only when the other model is requested. Barrier before HTTP response. `EVENT_SOURCE=self` → generator thread drives `EVENTS` requests through real HTTP (`EVENT_PATTERN`: alternate/burst/random, `EVENT_BURST`); `external` → waits for outside callers. |
 | `dispatch_report.py` | Per model: hit rate, swap_in/swap_out/run/e2e/queue percentiles; median e2e decomposition = queue + run + dispatch(swaps+sync+http). |
-| `k8s/neuron-mt-poc-job.yaml` | Job `neuron-mt-poc` → tenant_switch (user renamed this file; keep the name). SWITCHES=1000 currently. |
-| `k8s/neuron-mt-dispatch-job.yaml` | Job `neuron-mt-dispatch` → dispatch_serve. EVENTS=200, eager/alternate currently. |
+| `k8s/neuron-mt-poc-job.yaml` | **The only job spec** (job `neuron-mt-poc`). `EXPERIMENT` picks what runs: `switch` (tenant_switch + switch_report), `dispatch` (dispatch_serve + dispatch_report), `xfer` (bench_xfer both modes + xfer_report), `proc` (dispatch_proc). Defaults: `proc`, LNC=1 (`s-lnc1`), `NPROC=8`. To change LNC, change the claim template, the two LNC env vars and `NPROC` together. |
 | `bench_xfer.py` | Core-to-core transfer benchmark: host DRAM bounce vs HBM→HBM `broadcast` on the `neuron` backend, 2 ranks, size sweep, checksum-verified. |
 | `xfer_report.py` | Side-by-side table for the two transfer modes plus a fixed-cost + bandwidth fit. |
-| `k8s/neuron-mt-xfer-job.yaml` | Job `neuron-mt-xfer` → runs bench_xfer in both modes, then xfer_report. |
 | `app_run.py` | Part 3: one request for one app as its own torchrun job — init, load graph, restore state from `/dev/shm`, run, print MT_RESULT, snapshot to `/dev/shm`, exit (releases the cores). |
 | `dispatch_proc.py` | Part 3 dispatcher (no Neuron): HTTP `/e0` `/e1` `/shutdown`, launches `app_run.py` per request, replies on MT_RESULT before the snapshot, starts the next request only after the app exits. |
-| `k8s/neuron-mt-proc-job.yaml` | Job `neuron-mt-proc` → dispatch_proc, LNC=1, 8 ranks per app, 20 requests. |
 | `k8s/s-lnc1-rct.yaml` | ResourceClaimTemplate (1 device, LNC=1). |
 | `k8s/s-lnc2-rct.yaml` | ResourceClaimTemplate (1 device, LNC=2, trn2/trn3). |
 | `docs/two-container-approach.md` | Full deferred design: shared ResourceClaim across two containers, flock + turn-file protocol on emptyDir (crash-safe, deterministic alternation, no startup sleeps), what to measure, open questions (nrt_close vs process exit, preemption, cross-pod locking via hostPath/daemonset). |
 
-## Run history (all on 1 ND, LNC=2, 4 ranks, fp32)
+## Run history (1 ND, fp32; LNC=2 with 4 ranks unless noted)
+
+Runs 1–7 used separate job specs (`neuron-mt-dispatch`, `neuron-mt-xfer`, …).
+Those were merged into `k8s/neuron-mt-poc-job.yaml`; select the experiment
+with `EXPERIMENT`.
 
 ### Run 1 — FAILED: `ModuleNotFoundError: No module named 'torch_xla'`
 First version used torch_xla idioms. Image is eager torch-neuronx. Ported
@@ -203,7 +204,8 @@ caller        rank0 HTTP thread     rank0 main loop          ranks 1-3
 - `EVENT_SOURCE=external`: the server waits for outside callers. To drive it
   by hand:
   ```bash
-  POD=$(kubectl get pod -l job-name=neuron-mt-dispatch -o name)
+  # in k8s/neuron-mt-poc-job.yaml set EXPERIMENT=dispatch, EVENT_SOURCE=external
+  POD=$(kubectl get pod -l job-name=neuron-mt-poc -o name)
   kubectl port-forward "$POD" 8080:8080 &
   curl -s -X POST localhost:8080/e0
   curl -s -X POST localhost:8080/e1
@@ -274,10 +276,11 @@ Lazy-policy / burst-pattern comparison — expected: ~87% hit rate (7 of 8
 events in a burst skip both copies), e2e collapsing toward pure run time:
 
 ```bash
-kubectl delete job neuron-mt-dispatch
-sed -e 's/value: "eager"/value: "lazy"/' -e 's/value: "alternate"/value: "burst"/' \
-  k8s/neuron-mt-dispatch-job.yaml | kubectl apply -f -
-kubectl logs job/neuron-mt-dispatch -f
+kubectl delete job neuron-mt-poc --ignore-not-found
+sed -e 's/value: "proc"/value: "dispatch"/' -e 's/value: "eager"/value: "lazy"/' \
+    -e 's/value: "alternate"/value: "burst"/' \
+  k8s/neuron-mt-poc-job.yaml | kubectl apply -f -
+kubectl logs job/neuron-mt-poc -f
 # then compare dispatch_report output vs Run 5
 ```
 
@@ -320,8 +323,9 @@ from a host barrier, and the reported time is the slower of the two ranks.
 `time ≈ fixed + size / bandwidth` for each.
 
 ```bash
-kubectl apply -f k8s/neuron-mt-xfer-job.yaml
-kubectl logs job/neuron-mt-xfer -f | tee /tmp/neuron-mt-xfer
+# in k8s/neuron-mt-poc-job.yaml set EXPERIMENT=xfer
+kubectl apply -f k8s/neuron-mt-poc-job.yaml
+kubectl logs job/neuron-mt-poc -f | tee /tmp/neuron-mt-xfer
 ```
 
 ### Run 6 results (commit `89c7b60`, log `/tmp/neuron-mt-xfer`)
@@ -428,8 +432,10 @@ Tested locally with a stand-in `torchrun` and app (HTTP flow, early reply,
 queueing behind the previous exit, timing maths). Not yet run on hardware.
 
 ```bash
-kubectl apply -f k8s/neuron-mt-proc-job.yaml
-kubectl logs job/neuron-mt-proc -f | tee /tmp/neuron-mt-proc
+# EXPERIMENT=proc is the default in k8s/neuron-mt-poc-job.yaml
+kubectl delete job neuron-mt-poc --ignore-not-found
+kubectl apply -f k8s/neuron-mt-poc-job.yaml
+kubectl logs job/neuron-mt-poc -f | tee /tmp/neuron-mt-proc
 ```
 
 ## Roadmap after that

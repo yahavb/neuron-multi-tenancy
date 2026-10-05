@@ -13,9 +13,9 @@ spec:
         node-type: trn2
       resourceClaims:
         - name: neurons
-          resourceClaimTemplateName: s-lnc2
+          resourceClaimTemplateName: s-lnc1
       containers:
-        - name: dispatch
+        - name: mt
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b@sha256:404df227713513e8d01dadc03a8722825c8b9b526561c8d08897a6a5fecc0f06
           imagePullPolicy: Always
           command:
@@ -28,31 +28,60 @@ spec:
                 "https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/neuron-multi-tenancy.git" REPRO
               cd REPRO
 
-              RUN="mt_$(date -u +%Y%m%d_%H%M%S)"
+              RUN="${EXPERIMENT}_$(date -u +%Y%m%d_%H%M%S)"
               OUT=/tmp/mt_out; mkdir -p "$OUT"
               RUNDIR="/var/mdl/mt/$RUN"
 
               git rev-parse HEAD > "$OUT/commit.txt"
               git log -1 --pretty=%s >> "$OUT/commit.txt"
               neuronx-cc --version > "$OUT/cc.txt" 2>&1 || true
-              env | grep -E '^(T0_|T1_|ITERS|SWITCHES|NEURON)' | sort > "$OUT/flags.txt" || true
+              env | grep -E '^(EXPERIMENT|NPROC|T0_|T1_|ITERS|SWITCHES|EVENT|STEPS|DISPATCH|SIZES|XFER|NEURON)' \
+                | sort > "$OUT/flags.txt" || true
               cat "$OUT/commit.txt" "$OUT/cc.txt" "$OUT/flags.txt"
 
               archive() {
                 mkdir -p "$RUNDIR" || true
                 tar -czf "/tmp/$RUN.tar.gz" -C /tmp mt_out || true
                 cp "/tmp/$RUN.tar.gz" "$RUNDIR/" || true
-                if [ -s "$OUT/switch_report.json" ]; then cp "$OUT/switch_report.json" "$RUNDIR/" || true; fi
+                for f in "$OUT"/*report*.json "$OUT"/proc_stat.json; do
+                  if [ -s "$f" ]; then cp "$f" "$RUNDIR/" || true; fi
+                done
                 ls -la "$RUNDIR" 2>/dev/null || true
               }
               trap archive EXIT
 
-              MT_STAT="$OUT/mt_stat" \
-                torchrun --standalone --nproc-per-node 4 \
-                  tenant_switch.py 2>&1 | tee "$OUT/mt.log"
-
-              python3 -u switch_report.py "$OUT/mt_stat.rank*.json" \
-                "$OUT/switch_report.json" 2>&1 | tee "$OUT/report.log"
+              case "$EXPERIMENT" in
+                switch)
+                  MT_STAT="$OUT/mt_stat" \
+                    torchrun --standalone --nproc-per-node "$NPROC" \
+                      tenant_switch.py 2>&1 | tee "$OUT/mt.log"
+                  python3 -u switch_report.py "$OUT/mt_stat.rank*.json" \
+                    "$OUT/switch_report.json" 2>&1 | tee "$OUT/report.log"
+                  ;;
+                dispatch)
+                  MT_STAT="$OUT/dispatch_stat" \
+                    torchrun --standalone --nproc-per-node "$NPROC" \
+                      dispatch_serve.py 2>&1 | tee "$OUT/dispatch.log"
+                  python3 -u dispatch_report.py "$OUT/dispatch_stat.rank*.json" \
+                    "$OUT/dispatch_report.json" 2>&1 | tee "$OUT/report.log"
+                  ;;
+                xfer)
+                  for M in host hbm; do
+                    XFER_STAT="$OUT/xfer_stat" \
+                      torchrun --standalone --nproc-per-node 2 \
+                        bench_xfer.py --mode "$M" 2>&1 | tee "$OUT/xfer_$M.log" || true
+                  done
+                  python3 -u xfer_report.py "$OUT/xfer_stat.host.json" "$OUT/xfer_stat.hbm.json" \
+                    2>&1 | tee "$OUT/report.log" || true
+                  ;;
+                proc)
+                  MT_STAT="$OUT/proc_stat.json" \
+                    python3 -u dispatch_proc.py 2>&1 | tee "$OUT/proc.log"
+                  ;;
+                *)
+                  echo "unknown EXPERIMENT=$EXPERIMENT (switch | dispatch | xfer | proc)"; exit 1
+                  ;;
+              esac
           resources:
             claims:
               - name: neurons
@@ -62,14 +91,31 @@ spec:
             - { name: dshm, mountPath: /dev/shm }
             - { name: 621547421844-ap-southeast-4-pvc, mountPath: /var/mdl }
           env:
+            # switch = tenant_switch (Part 1), dispatch = dispatch_serve (Part 2),
+            # xfer = core-to-core transfer bench, proc = process per request (Part 3)
+            - { name: EXPERIMENT,               value: "proc" }
+            # ranks per app; must equal the core count: 8 at LNC=1, 4 at LNC=2
+            - { name: NPROC,                    value: "8" }
             - { name: PYTHONUNBUFFERED,         value: "1" }
             - { name: BRANCH,                   value: "main" }
             - { name: T0_DIM,                   value: "2048" }
             - { name: T1_DIM,                   value: "1536" }
+            # switch
             - { name: ITERS,                    value: "10" }
             - { name: SWITCHES,                 value: "1000" }
-            - { name: NEURON_LOGICAL_NC_CONFIG, value: "2" }
-            - { name: NEURON_CC_FLAGS,          value: "--target trn2 --lnc 2" }
+            # dispatch and proc
+            - { name: EVENTS,                   value: "20" }
+            - { name: EVENT_PATTERN,            value: "alternate" }
+            - { name: EVENT_BURST,              value: "4" }
+            - { name: STEPS_PER_EVENT,          value: "10" }
+            - { name: EVENT_SOURCE,             value: "self" }
+            - { name: DISPATCH_POLICY,          value: "eager" }
+            # xfer
+            - { name: SIZES_MIB,                value: "1,4,16,64,256,1024" }
+            - { name: XFER_ITERS,               value: "20" }
+            # LNC: change together with resourceClaimTemplateName and NPROC
+            - { name: NEURON_LOGICAL_NC_CONFIG, value: "1" }
+            - { name: NEURON_CC_FLAGS,          value: "--target trn2 --lnc 1" }
             - { name: NEURON_RT_LOG_LEVEL,      value: "ERROR" }
             - name: GITHUB_TOKEN
               valueFrom: { secretKeyRef: { name: github-token, key: GITHUB_TOKEN } }

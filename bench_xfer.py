@@ -19,7 +19,7 @@ one transfer runs, and the received checksum must match the sender's.
     torchrun --standalone --nproc-per-node 2 bench_xfer.py --mode host
     torchrun --standalone --nproc-per-node 2 bench_xfer.py --mode hbm
 
-Env: SIZES_MIB (default 1,4,16,64,256,1024), ITERS (20), XFER_STAT.
+Env: SIZES_MIB (default 1,4,16,64,256,1024), XFER_ITERS (20), XFER_STAT.
 """
 
 import json
@@ -38,7 +38,7 @@ if MODE not in ("host", "hbm"):
     raise SystemExit("--mode must be host | hbm")
 
 SIZES_MIB = [int(s) for s in os.environ.get("SIZES_MIB", "1,4,16,64,256,1024").split(",")]
-ITERS = int(os.environ.get("ITERS", "20"))
+ITERS = int(os.environ.get("XFER_ITERS", "20"))
 STAT = os.environ.get("XFER_STAT", "/tmp/xfer_stat")
 SHM = "/dev/shm/xfer_buf.npy"
 
